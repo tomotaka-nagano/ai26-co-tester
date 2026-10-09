@@ -1,0 +1,22 @@
+[project]
+name = "co-test-driver"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "exmgai",
+    "fastapi>=0.136.1",
+    "httpx>=0.28.1",
+    "mcp>=1.0",
+    "uvicorn>=0.35.0",
+]
+
+[tool.uv.sources]
+exmgai = { git = "https://github.com/tomotaka-nagano/exmgai.git", rev = "v0.0.6" }
+
+[dependency-groups]
+dev = [
+    "flake8>=7.0",
+    "pytest>=8.0",
+]

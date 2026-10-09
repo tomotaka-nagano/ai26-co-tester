@@ -1,0 +1,20 @@
+[[environments]]
+id = 'local'
+name = 'Local command runner'
+enabled = true
+command = [
+    '{product_path}',
+    '--testcase', '{testcase_path}',
+    '--output', '{result_path}',
+]
+
+[[environments]]
+id = 'ai-gen-test'
+name = 'AI Gen Test MCP'
+backend = 'ai-gen-test'
+enabled = true
+url = 'http://127.0.0.1:8001/mcp'
+base_revision = 'baseline'
+max_rounds = 3
+poll_interval_seconds = 0.5
+timeout_seconds = 300.0

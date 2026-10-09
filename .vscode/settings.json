@@ -1,0 +1,11 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "uv": true,
+        "git ls-remote": true,
+        "/^python -c \"import exmgai; import inspect; print\\(inspect\\.getfile\\(exmgai\\)\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "&": true
+    }
+}

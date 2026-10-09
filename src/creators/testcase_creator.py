@@ -3,6 +3,7 @@ from pathlib import Path
 
 from exmgai import Client
 from src.schemas.scenario import Scenario
+from src.schemas.testcase import Testcases
 
 
 CREATE_PROMPT = """\
@@ -52,6 +53,27 @@ DESCRIBE_PROMPT = """\
 """
 
 
+REPAIR_PROMPT = """\
+あなたはシミュレーション用テストケースを修正するテストエンジニアです。
+原因分析に基づき、誤りのあるテストケースだけを修正してください。
+
+## 指示
+- 全テストケースを含む修正後の完全な一覧を返してください。
+- 原因分析で影響対象とされていないケースは変更しないでください。
+- インターフェース資料に記載された構造、フィールド、値に厳密に準拠してください。
+- 製品不具合を隠すために期待値を実行結果へ合わせてはなりません。
+
+# 現在のテストケース
+{testcases}
+
+# 原因分析
+{analysis}
+
+# インターフェース資料
+{api_doc}
+"""
+
+
 class TestcaseCreator:
 
     def __init__(self, api_doc_path: str | Path):
@@ -73,8 +95,9 @@ class TestcaseCreator:
                 api_doc=self._api_doc,
             )
 
-            response = client.chat.create(prompt)
-            result = self._parse_json_array(response.content)
+            response = client.chat.create(prompt, response_format=Testcases)
+            generated = Testcases.model_validate(response.content)
+            result = [item.model_dump(mode='json') for item in generated.items]
             all_groups.append(result)
 
             print(f'シナリオ {i} ({scenario.summary[:30]}...) → {len(result)} テストケース生成')
@@ -106,14 +129,19 @@ class TestcaseCreator:
 
         return '\n\n'.join(md_parts)
 
-    @staticmethod
-    def _parse_json_array(text: str) -> list[dict]:
-        text = text.strip()
-        # コードブロックで囲まれている場合を除去
-        if text.startswith('```'):
-            text = text.split('\n', 1)[1]
-            text = text.rsplit('```', 1)[0].strip()
-        return json.loads(text)
+    def repair(
+        self, testcases: list[dict], analysis: dict
+    ) -> list[dict]:
+        prompt = REPAIR_PROMPT.format(
+            testcases=json.dumps(testcases, ensure_ascii=False, indent=2),
+            analysis=json.dumps(analysis, ensure_ascii=False, indent=2),
+            api_doc=self._api_doc,
+        )
+        response = Client('gpt-5.4').chat.create(
+            prompt, response_format=Testcases
+        )
+        repaired = Testcases.model_validate(response.content)
+        return [item.model_dump(mode='json') for item in repaired.items]
 
     @staticmethod
     def _extract_list(data: list | dict) -> list[dict]:

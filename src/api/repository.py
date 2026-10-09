@@ -12,6 +12,8 @@ from src.api.models import VerificationCreate, VerificationStatus
 
 TERMINAL_STATUSES = {
     VerificationStatus.COMPLETED,
+    VerificationStatus.COMPLETED_OK,
+    VerificationStatus.COMPLETED_NG,
     VerificationStatus.ERROR,
     VerificationStatus.CANCELED,
 }
@@ -41,6 +43,10 @@ class VerificationRepository:
     def _initialize(self) -> None:
         with self._connection() as connection:
             connection.execute(_CREATE_TABLE)
+            connection.execute(_CREATE_SCENARIO_REVISIONS)
+            connection.execute(_CREATE_SCENARIO_MESSAGES)
+            connection.execute(_CREATE_SCENARIO_PROPOSALS)
+            connection.execute(_CREATE_APPROVAL_EVENTS)
             columns = {
                 row['name']
                 for row in connection.execute(
@@ -106,15 +112,212 @@ class VerificationRepository:
     def request_cancel(self, verification_id: str) -> dict[str, Any]:
         return self.update(verification_id, cancel_requested=1)
 
+    def create_approval_event(
+        self,
+        verification_id: str,
+        action: str,
+        reason: str | None,
+        final_verdict: str | None,
+    ) -> dict[str, Any]:
+        created_at = datetime.now(UTC).isoformat()
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                _INSERT_APPROVAL_EVENT,
+                (verification_id, action, reason, final_verdict, created_at),
+            )
+            event_id = cursor.lastrowid
+            row = connection.execute(
+                'SELECT * FROM approval_events WHERE id = ?', (event_id,)
+            ).fetchone()
+        return dict(row)
+
+    def approval_events(self, verification_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                'SELECT action, reason, final_verdict, created_at '
+                'FROM approval_events WHERE verification_id = ? ORDER BY id',
+                (verification_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_scenario_revision(
+        self, verification_id: str, scenarios: list[dict[str, Any]]
+    ) -> int:
+        with self._lock, self._connection() as connection:
+            revision = self._next_scenario_revision(connection, verification_id)
+            connection.execute(
+                _INSERT_SCENARIO_REVISION,
+                (
+                    verification_id,
+                    revision,
+                    json.dumps(scenarios, ensure_ascii=False),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+        return revision
+
+    def latest_scenario_revision(self, verification_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                'SELECT * FROM scenario_revisions WHERE verification_id = ? '
+                'ORDER BY revision DESC LIMIT 1',
+                (verification_id,),
+            ).fetchone()
+        return self._scenario_revision(row) if row else None
+
+    def get_scenario_revision(
+        self, verification_id: str, revision: int
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                'SELECT * FROM scenario_revisions '
+                'WHERE verification_id = ? AND revision = ?',
+                (verification_id, revision),
+            ).fetchone()
+        return self._scenario_revision(row) if row else None
+
+    def add_scenario_message(
+        self, verification_id: str, role: str, content: str
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                _INSERT_SCENARIO_MESSAGE,
+                (verification_id, role, content, datetime.now(UTC).isoformat()),
+            )
+
+    def scenario_messages(self, verification_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                'SELECT role, content, created_at FROM scenario_messages '
+                'WHERE verification_id = ? ORDER BY id',
+                (verification_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_scenario_proposal(
+        self,
+        proposal_id: str,
+        verification_id: str,
+        base_revision: int,
+        reply: str,
+        reason: str,
+        scenarios: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                _INSERT_SCENARIO_PROPOSAL,
+                (
+                    proposal_id,
+                    verification_id,
+                    base_revision,
+                    reply,
+                    reason,
+                    json.dumps(scenarios, ensure_ascii=False),
+                    'pending',
+                    now,
+                    now,
+                ),
+            )
+        return self.get_scenario_proposal(proposal_id)
+
+    def get_scenario_proposal(self, proposal_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                'SELECT * FROM scenario_proposals WHERE id = ?', (proposal_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(proposal_id)
+        return self._scenario_proposal(row)
+
+    def scenario_proposals(self, verification_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                'SELECT * FROM scenario_proposals WHERE verification_id = ? '
+                'ORDER BY created_at',
+                (verification_id,),
+            ).fetchall()
+        return [self._scenario_proposal(row) for row in rows]
+
+    def accept_scenario_proposal(self, proposal_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            proposal = connection.execute(
+                'SELECT * FROM scenario_proposals WHERE id = ?', (proposal_id,)
+            ).fetchone()
+            if proposal is None:
+                raise KeyError(proposal_id)
+            if proposal['status'] != 'pending':
+                raise ValueError('提案は既に処理されています')
+            revision = self._next_scenario_revision(
+                connection, proposal['verification_id']
+            )
+            if revision - 1 != proposal['base_revision']:
+                raise ValueError('提案元のシナリオ版が最新ではありません')
+            connection.execute(
+                _INSERT_SCENARIO_REVISION,
+                (
+                    proposal['verification_id'],
+                    revision,
+                    proposal['scenarios_json'],
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            connection.execute(
+                'UPDATE scenario_proposals SET status = ?, updated_at = ? WHERE id = ?',
+                ('accepted', datetime.now(UTC).isoformat(), proposal_id),
+            )
+        return self.latest_scenario_revision(proposal['verification_id']) or {}
+
+    def reject_scenario_proposal(self, proposal_id: str) -> dict[str, Any]:
+        proposal = self.get_scenario_proposal(proposal_id)
+        if proposal['status'] != 'pending':
+            raise ValueError('提案は既に処理されています')
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                'UPDATE scenario_proposals SET status = ?, updated_at = ? WHERE id = ?',
+                ('rejected', datetime.now(UTC).isoformat(), proposal_id),
+            )
+        return self.get_scenario_proposal(proposal_id)
+
+    @staticmethod
+    def _next_scenario_revision(
+        connection: sqlite3.Connection, verification_id: str
+    ) -> int:
+        row = connection.execute(
+            'SELECT COALESCE(MAX(revision), 0) AS revision FROM scenario_revisions '
+            'WHERE verification_id = ?',
+            (verification_id,),
+        ).fetchone()
+        return int(row['revision']) + 1
+
+    @staticmethod
+    def _scenario_revision(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data['scenarios'] = json.loads(data.pop('scenarios_json'))
+        return data
+
+    @staticmethod
+    def _scenario_proposal(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data['proposal_id'] = data.pop('id')
+        data['scenarios'] = json.loads(data.pop('scenarios_json'))
+        return data
+
     def recover_incomplete(self) -> None:
-        terminal_values = [status.value for status in TERMINAL_STATUSES]
-        placeholders = ', '.join('?' for _ in terminal_values)
+        preserved = [
+            *TERMINAL_STATUSES,
+            VerificationStatus.REVIEWING_SCENARIOS,
+            VerificationStatus.AWAITING_APPROVAL,
+            VerificationStatus.AWAITING_RESULT_APPROVAL,
+        ]
+        preserved_values = [status.value for status in preserved]
+        placeholders = ', '.join('?' for _ in preserved_values)
         query = f'UPDATE verifications SET status = ?, error = ?, updated_at = ? WHERE status NOT IN ({placeholders})'
         values = [
             VerificationStatus.ERROR.value,
             'API プロセスの再起動により処理が中断されました',
             datetime.now(UTC).isoformat(),
-            *terminal_values,
+            *preserved_values,
         ]
         with self._lock, self._connection() as connection:
             connection.execute(query, values)
@@ -179,4 +382,88 @@ _MIGRATION_COLUMNS = {
     'remote_phase': 'TEXT',
     'agent_round': 'INTEGER NOT NULL DEFAULT 0',
     'max_rounds': 'INTEGER NOT NULL DEFAULT 1',
+    'repair_count': 'INTEGER NOT NULL DEFAULT 0',
+    'cycle_number': 'INTEGER NOT NULL DEFAULT 1',
 }
+
+
+_CREATE_SCENARIO_REVISIONS = """
+CREATE TABLE IF NOT EXISTS scenario_revisions (
+    verification_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    scenarios_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (verification_id, revision),
+    FOREIGN KEY (verification_id) REFERENCES verifications(id)
+)
+"""
+
+
+_CREATE_SCENARIO_MESSAGES = """
+CREATE TABLE IF NOT EXISTS scenario_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (verification_id) REFERENCES verifications(id)
+)
+"""
+
+
+_CREATE_SCENARIO_PROPOSALS = """
+CREATE TABLE IF NOT EXISTS scenario_proposals (
+    id TEXT PRIMARY KEY,
+    verification_id TEXT NOT NULL,
+    base_revision INTEGER NOT NULL,
+    reply TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    scenarios_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (verification_id) REFERENCES verifications(id)
+)
+"""
+
+
+_INSERT_SCENARIO_REVISION = """
+INSERT INTO scenario_revisions (
+    verification_id, revision, scenarios_json, created_at
+) VALUES (?, ?, ?, ?)
+"""
+
+
+_INSERT_SCENARIO_MESSAGE = """
+INSERT INTO scenario_messages (
+    verification_id, role, content, created_at
+) VALUES (?, ?, ?, ?)
+"""
+
+
+_INSERT_SCENARIO_PROPOSAL = """
+INSERT INTO scenario_proposals (
+    id, verification_id, base_revision, reply, reason, scenarios_json,
+    status, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+_CREATE_APPROVAL_EVENTS = """
+CREATE TABLE IF NOT EXISTS approval_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT,
+    final_verdict TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (verification_id) REFERENCES verifications(id)
+)
+"""
+
+
+_INSERT_APPROVAL_EVENT = """
+INSERT INTO approval_events (
+    verification_id, action, reason, final_verdict, created_at
+) VALUES (?, ?, ?, ?, ?)
+"""

@@ -11,3 +11,7 @@ env.toml
 
 # runtime data
 data/
+
+# web
+web/node_modules/
+web/dist/

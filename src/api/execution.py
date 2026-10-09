@@ -13,6 +13,7 @@ from exmgai import Client
 from src.api.models import (
     AgentDecision,
     ArtifactReference,
+    ResultAnalysis,
     TestCounts,
     TestEnvironment,
     TestEnvironmentState,
@@ -26,9 +27,27 @@ from src.schemas.inputs import Requirement
 
 
 FAILURE_PROMPT = """\
-あなたはテストエンジニアです。以下のテスト実行結果について、Fail または実行不能の原因と、要求への影響を簡潔に解釈してください。
-事実と推測を分け、追加確認が必要な点を明記してください。
+あなたは組込み製品のテスト結果を分析するテストエンジニアです。
+要求、実行したテストケース、失敗結果から主原因を分類してください。
 
+## 分類
+- testcase_defect: 入力、期待値、待機条件などテストケース自体の誤り
+- product_or_spec_defect: 製品実装または仕様に起因する不一致
+- environment_defect: シミュレータ、ビルド、通信など環境起因
+- unknown: 根拠不足で分類不能
+
+## 指示
+- 観測できる事実と推測を別フィールドにしてください。
+- affected_testcasesには修正または確認対象のテストケース名を記載してください。
+- confidenceは0から1で示してください。
+
+# 要求
+{requirements}
+
+# テストケース
+{testcases}
+
+# 実行結果
 {results}
 """
 
@@ -93,14 +112,28 @@ class GenerationPipeline:
         self.resolver = resolver
 
     def generate(self, request: Any, work_dir: Path) -> dict[str, str]:
-        work_dir.mkdir(parents=True, exist_ok=True)
-        requirements = self._load_requirements(
-            self.resolver.resolve(request.requirements)
+        artifacts = self.generate_scenarios(request, work_dir)
+        artifacts.update(
+            self.generate_testcases(request, work_dir, Path(artifacts['scenarios_path']))
         )
+        return artifacts
+
+    def generate_scenarios(self, request: Any, work_dir: Path) -> dict[str, str]:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        requirements = self._load_source_documents(request)
         scenarios = ScenarioCreator(requirements).create()
         scenario_path = work_dir / 'scenarios.json'
         scenario_path.write_text(scenarios.model_dump_json(indent=2), encoding='utf-8')
-        groups = TestcaseCreator(self.resolver.resolve(request.design)).generate(
+        judgment_path = self._write_judgments(work_dir, scenarios.model_dump()['items'])
+        return {
+            'scenarios_path': str(scenario_path),
+            'llm_judgment_log_path': str(judgment_path),
+        }
+
+    def generate_testcases(
+        self, request: Any, work_dir: Path, scenario_path: Path
+    ) -> dict[str, str]:
+        groups = TestcaseCreator(self._resolve_interface_spec(request)).generate(
             scenario_path
         )
         testcases = [testcase for group in groups for testcase in group]
@@ -108,11 +141,20 @@ class GenerationPipeline:
         testcase_path.write_text(
             json.dumps(testcases, ensure_ascii=False, indent=2), encoding='utf-8'
         )
-        judgment_path = self._write_judgments(work_dir, scenarios.model_dump()['items'])
-        return {
-            'testcases_path': str(testcase_path),
-            'llm_judgment_log_path': str(judgment_path),
-        }
+        return {'testcases_path': str(testcase_path)}
+
+    def refine_scenarios(
+        self,
+        request: Any,
+        scenarios: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+        message: str,
+    ) -> dict[str, Any]:
+        requirements = self._load_source_documents(request)
+        refinement = ScenarioCreator(requirements).refine(
+            scenarios, history, message
+        )
+        return refinement.model_dump(mode='json')
 
     def decide_additional_tests(
         self,
@@ -121,7 +163,7 @@ class GenerationPipeline:
         testcases: list[dict[str, Any]],
         results: list[dict[str, Any]],
     ) -> AgentDecision:
-        requirements = self._load_requirements(self.resolver.resolve(request.requirements))
+        requirements = self._load_source_documents(request)
         prompt = AGENT_PROMPT.format(
             requirements=requirements,
             rules=rules,
@@ -134,6 +176,50 @@ class GenerationPipeline:
         if not decision.testcases:
             decision.continue_verification = False
         return decision
+
+    def analyze_failure(
+        self,
+        request: Any,
+        testcases: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> ResultAnalysis:
+        requirements = self._load_source_documents(request)
+        prompt = FAILURE_PROMPT.format(
+            requirements=requirements,
+            testcases=json.dumps(testcases, ensure_ascii=False, indent=2),
+            results=json.dumps(results, ensure_ascii=False, indent=2),
+        )
+        response = Client('gpt-5.4').chat.create(
+            prompt, response_format=ResultAnalysis
+        )
+        return ResultAnalysis.model_validate(response.content)
+
+    def repair_testcases(
+        self,
+        request: Any,
+        testcases: list[dict[str, Any]],
+        analysis: ResultAnalysis,
+    ) -> list[dict[str, Any]]:
+        creator = TestcaseCreator(self._resolve_interface_spec(request))
+        return creator.repair(testcases, analysis.model_dump(mode='json'))
+
+    def _load_source_documents(self, request: Any) -> str:
+        if request.source_documents:
+            return '\n\n'.join(
+                self._render_source_document(document)
+                for document in request.source_documents
+            )
+        return self._load_requirements(self.resolver.resolve(request.requirements))
+
+    def _render_source_document(self, document: Any) -> str:
+        path = self.resolver.resolve(document.artifact)
+        title = document.title or path.name
+        content = self._load_requirements(path)
+        return f'## {document.type.value}: {title}\n出典: {path}\n\n{content}'
+
+    def _resolve_interface_spec(self, request: Any) -> Path:
+        reference = request.interface_spec or request.design
+        return self.resolver.resolve(reference)
 
     @staticmethod
     def _remove_duplicates(

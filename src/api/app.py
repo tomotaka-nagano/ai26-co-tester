@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.staticfiles import StaticFiles
 
 from src.api.execution import (
     ArtifactResolver,
@@ -13,6 +14,10 @@ from src.api.ai_gen_test import AgenticTestRunner
 from src.api.models import (
     ArtifactBundle,
     Health,
+    ResultApprovalRequest,
+    ScenarioProposal,
+    ScenarioRefineRequest,
+    ScenarioReview,
     TestEnvironment,
     VerificationAccepted,
     VerificationCreate,
@@ -56,8 +61,16 @@ def create_service() -> VerificationService:
 def create_app(service: VerificationService | None = None) -> FastAPI:
     api = FastAPI(title='Co-Test Driver API', version='0.1.0')
     api.state.verifications = service or create_service()
+    api.router.add_event_handler('shutdown', api.state.verifications.close)
     _register_routes(api)
+    _mount_web_ui(api)
     return api
+
+
+def _mount_web_ui(api: FastAPI) -> None:
+    web_root = PROJECT_ROOT / 'web' / 'dist'
+    if web_root.is_dir():
+        api.mount('/ui', StaticFiles(directory=web_root, html=True), name='ui')
 
 
 def _service(api: FastAPI) -> VerificationService:
@@ -98,6 +111,43 @@ def _register_routes(api: FastAPI) -> None:
     def get_artifacts(verification_id: str) -> ArtifactBundle:
         return _call(_service(api).artifacts, verification_id)
 
+    @api.get(
+        '/verifications/{verification_id}/scenarios', response_model=ScenarioReview
+    )
+    def get_scenarios(verification_id: str) -> ScenarioReview:
+        return _call(_service(api).scenarios, verification_id)
+
+    @api.post(
+        '/verifications/{verification_id}/scenarios/messages',
+        response_model=ScenarioProposal,
+    )
+    def refine_scenarios(
+        verification_id: str, request: ScenarioRefineRequest
+    ) -> ScenarioProposal:
+        return _call(_service(api).refine_scenarios, verification_id, request)
+
+    @api.post(
+        '/verifications/{verification_id}/scenarios/proposals/{proposal_id}/accept',
+        response_model=ScenarioReview,
+    )
+    def accept_scenario_proposal(
+        verification_id: str, proposal_id: str
+    ) -> ScenarioReview:
+        return _call(
+            _service(api).accept_scenario_proposal, verification_id, proposal_id
+        )
+
+    @api.post(
+        '/verifications/{verification_id}/scenarios/proposals/{proposal_id}/reject',
+        response_model=ScenarioProposal,
+    )
+    def reject_scenario_proposal(
+        verification_id: str, proposal_id: str
+    ) -> ScenarioProposal:
+        return _call(
+            _service(api).reject_scenario_proposal, verification_id, proposal_id
+        )
+
     @api.post(
         '/verifications/{verification_id}/cancel',
         response_model=VerificationState,
@@ -113,6 +163,24 @@ def _register_routes(api: FastAPI) -> None:
     )
     def approve_verification(verification_id: str) -> VerificationAccepted:
         return _call(_service(api).approve, verification_id)
+
+    @api.post(
+        '/verifications/{verification_id}/scenarios/approve',
+        response_model=VerificationAccepted,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def approve_scenarios(verification_id: str) -> VerificationAccepted:
+        return _call(_service(api).approve_scenarios, verification_id)
+
+    @api.post(
+        '/verifications/{verification_id}/result-approval',
+        response_model=VerificationAccepted,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def approve_result(
+        verification_id: str, request: ResultApprovalRequest
+    ) -> VerificationAccepted:
+        return _call(_service(api).approve_result, verification_id, request)
 
     @api.post(
         '/verifications/{verification_id}/rerun',
